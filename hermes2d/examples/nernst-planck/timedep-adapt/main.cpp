@@ -3,6 +3,11 @@
 #define HERMES_REPORT_VERBOSE
 #define HERMES_REPORT_FILE "application.log"
 
+#include "hermes2d.h"
+#include "weakform/weakform.h"
+#include "integrals/h1.h"
+#include "boundaryconditions/essential_bcs.h"
+
 #include "timestep_controller.h"
 
 using namespace RefinementSelectors;
@@ -27,13 +32,13 @@ using namespace RefinementSelectors;
  migration/diffusion of charged particles due to applied voltage.
  The simulation domain looks as follows:
  \verbatim
-      2
-  +----------+
-  |          |
- 1|          |1
-  |          |
-  +----------+
-      3
+      Top
+     +----------+
+     |          |
+ Side|          |Side
+     |          |
+     +----------+
+      Bottom
  \endverbatim
  For the Nernst-Planck equation, all the boundaries are natural i.e. Neumann.
  Which basically means that the normal derivative is 0:
@@ -76,7 +81,7 @@ double *TAU = &INIT_TAU;                          // Size of the time step
 const int P_INIT = 2;       	                    // Initial polynomial degree of all mesh elements.
 const int REF_INIT = 3;     	                    // Number of initial refinements.
 const bool MULTIMESH = true;	                    // Multimesh?
-const int TIME_DISCR = 1;                         // 1 for implicit Euler, 2 for Crank-Nicolson.
+const int TIME_DISCR = 2;                         // 1 for implicit Euler, 2 for Crank-Nicolson.
 
 const double NEWTON_TOL_COARSE = 0.01;            // Stopping criterion for Newton on coarse mesh.
 const double NEWTON_TOL_FINE = 0.05;              // Stopping criterion for Newton on fine mesh.
@@ -119,13 +124,14 @@ MatrixSolverType matrix_solver = SOLVER_UMFPACK;  // Possibilities: SOLVER_AMESO
 #include "initial_conditions.cpp"
 
 // Boundary markers.
-const std::string BDY_SIDE = "1";
-const std::string BDY_TOP = "2";
-const std::string BDY_BOT = "3";
+const std::string BDY_SIDE = "Side";
+const std::string BDY_TOP = "Top";
+const std::string BDY_BOT = "Bottom";
 
 int main (int argc, char* argv[]) {
   // Initialize the library's global functions.
   Hermes2D hermes2D;
+
 
   // Load the mesh file.
   Mesh C_mesh, phi_mesh, basemesh;
@@ -142,7 +148,8 @@ int main (int argc, char* argv[]) {
 
   DefaultEssentialBCConst bc_phi_voltage(BDY_TOP, VOLTAGE);
   DefaultEssentialBCConst bc_phi_zero(BDY_BOT, 0.0);
-  EssentialBCs bcs_phi(Hermes::vector<EssentialBC*>(&bc_phi_voltage, &bc_phi_zero));
+
+  EssentialBCs bcs_phi(Hermes::vector<EssentialBoundaryCondition* >(&bc_phi_voltage, &bc_phi_zero));
 
   // Spaces for concentration and the voltage.
   H1Space C_space(&C_mesh, P_INIT);
@@ -157,27 +164,26 @@ int main (int argc, char* argv[]) {
   InitialSolutionVoltage phi_prev_time(MULTIMESH ? &phi_mesh : &C_mesh);
 
   // The weak form for 2 equations.
-  CustomWeakFormNernstPlanckEuler wf(TAU, C0, lin_force_coup, mech_lambda, mech_mu, K, L, D, &C_prev_time);
-  // Add the bilinear and linear forms.
-  if (TIME_DISCR == 2)
-	  error("Crank-Nicholson forms are not implemented yet");
+  WeakForm *wf;
+  if (TIME_DISCR == 2) {
+    wf = new CustomWeakFormNernstPlanckCranic(TAU, C0, lin_force_coup, mech_lambda, mech_mu, K, L, D, &C_prev_time, &phi_prev_time);
+  } else {
+    wf = new CustomWeakFormNernstPlanckEuler(TAU, C0, lin_force_coup, mech_lambda, mech_mu, K, L, D, &C_prev_time);
+  }
 
-  // Project the initial condition on the FE space to obtain initial
-  // coefficient vector for the Newton's method.
-  info("Projecting initial condition to obtain initial vector for the Newton's method.");
-  scalar* coeff_vec_coarse = new scalar[ndof];
-  OGProjection::project_global(Hermes::vector<Space *>(&C_space, &phi_space), 
-                               Hermes::vector<MeshFunction *>(&C_prev_time, &phi_prev_time), 
-                               coeff_vec_coarse, matrix_solver);
-
-  // Initialize the FE problem.
-  bool is_linear = false;
-  DiscreteProblem dp_coarse(&wf, Hermes::vector<Space *>(&C_space, &phi_space), is_linear);
-
-  // Set up the solver, matrix, and rhs for the coarse mesh according to the solver selection.
   SparseMatrix* matrix_coarse = create_matrix(matrix_solver);
   Vector* rhs_coarse = create_vector(matrix_solver);
   Solver* solver_coarse = create_linear_solver(matrix_solver, matrix_coarse, rhs_coarse);
+
+  // Project the initial condition on the FE space to obtain initial
+  // coefficient vector for the Newton's method.
+  info("Projecting to obtain initial vector for the Newton's method.");
+  scalar* coeff_vec_coarse = new scalar[Space::get_num_dofs(Hermes::vector<Space *>(&C_space, &phi_space))] ;
+  OGProjection::project_global(Hermes::vector<Space *>(&C_space, &phi_space),
+      Hermes::vector<MeshFunction *>(&C_prev_time, &phi_prev_time),
+      coeff_vec_coarse, matrix_solver);
+
+  DiscreteProblem dp_coarse(wf, Hermes::vector<Space *>(&C_space, &phi_space));
 
   // Create a selector which will select optimal candidate.
   H1ProjBasedSelector selector(CAND_LIST, CONV_EXP, H2DRS_DEFAULT_ORDER);
@@ -195,10 +201,12 @@ int main (int argc, char* argv[]) {
   phiordview.show(&phi_space);
 
   // Newton's loop on the coarse mesh.
-  info("Solving on coarse mesh:");
   bool verbose = true;
-  if (!hermes2D.solve_newton(coeff_vec_coarse, &dp_coarse, solver_coarse, matrix_coarse, rhs_coarse, 
+  bool jacobian_changed = true;
+  if (!hermes2D.solve_newton(coeff_vec_coarse, &dp_coarse, solver_coarse, matrix_coarse, rhs_coarse, jacobian_changed,
       NEWTON_TOL_COARSE, NEWTON_MAX_ITER, verbose)) error("Newton's iteration failed.");
+
+  //View::wait(HERMES_WAIT_KEYPRESS);
 
   // Translate the resulting coefficient vector into the Solution sln.
   Solution::vector_to_solutions(coeff_vec_coarse, Hermes::vector<Space *>(&C_space, &phi_space), 
@@ -218,6 +226,7 @@ int main (int argc, char* argv[]) {
   TAU = pid.timestep;
   info("Starting time iteration with the step %g", *TAU);
 
+
   do {
     pid.begin_step();
     // Periodic global derefinements.
@@ -232,10 +241,6 @@ int main (int argc, char* argv[]) {
       C_space.set_uniform_order(P_INIT);
       phi_space.set_uniform_order(P_INIT);
 
-      // Project on globally derefined mesh.
-      //info("Projecting previous fine mesh solution on derefined mesh.");
-      //OGProjection::project_global(Hermes::vector<Space *>(&C, &phi), Hermes::vector<Solution *>(&C_ref_sln, &phi_ref_sln), 
-       //                            Hermes::vector<Solution *>(&C_sln, &phi_sln));
     }
 
     // Adaptivity loop. Note: C_prev_time and Phi_prev_time must not be changed during spatial adaptivity.
@@ -249,7 +254,7 @@ int main (int argc, char* argv[]) {
       Hermes::vector<Space *>* ref_spaces = Space::construct_refined_spaces(Hermes::vector<Space *>(&C_space, &phi_space));
 
       scalar* coeff_vec = new scalar[Space::get_num_dofs(*ref_spaces)];
-      DiscreteProblem* dp = new DiscreteProblem(&wf, *ref_spaces, is_linear);
+      DiscreteProblem* dp = new DiscreteProblem(wf, *ref_spaces);
       SparseMatrix* matrix = create_matrix(matrix_solver);
       Vector* rhs = create_vector(matrix_solver);
       Solver* solver = create_linear_solver(matrix_solver, matrix, rhs);
@@ -274,13 +279,13 @@ int main (int argc, char* argv[]) {
 
       // Newton's loop on the fine mesh.
       info("Solving on fine mesh:");
-      if (!hermes2D.solve_newton(coeff_vec, dp, solver, matrix, rhs, 
-	  	      NEWTON_TOL_FINE, NEWTON_MAX_ITER, verbose)) error("Newton's iteration failed.");
-
+      if (!hermes2D.solve_newton(coeff_vec, dp, solver, matrix, rhs, jacobian_changed,
+          NEWTON_TOL_FINE, NEWTON_MAX_ITER, verbose)) error("Newton's iteration failed.");
 
       // Store the result in ref_sln.
       Solution::vector_to_solutions(coeff_vec, *ref_spaces, 
                                     Hermes::vector<Solution *>(&C_ref_sln, &phi_ref_sln));
+
       // Projecting reference solution onto the coarse mesh
       info("Projecting fine mesh solution on coarse mesh.");
       OGProjection::project_global(Hermes::vector<Space *>(&C_space, &phi_space), 
@@ -319,9 +324,7 @@ int main (int argc, char* argv[]) {
 
         if (Space::get_num_dofs(Hermes::vector<Space *>(&C_space, &phi_space)) >= NDOF_STOP) 
           done = true;
-        else
-          // Increase the counter of performed adaptivity steps.
-          as++;
+        else as++;
       }
 
       // Visualize the solution and mesh.
@@ -348,19 +351,12 @@ int main (int argc, char* argv[]) {
       //View::wait(HERMES_WAIT_KEYPRESS);
 
       // Clean up.
-      info("delete solver");
       delete solver;
-      info("delete matrix");
       delete matrix;
-      info("delete rhs");
       delete rhs;
-      info("delete adaptivity");
       delete adaptivity;
-      info("delete[] ref_spaces");
       delete ref_spaces;
-      info("delete dp");
       delete dp;
-      info("delete[] coeff_vec");
       delete[] coeff_vec;
     }
     while (done == false);

@@ -3,6 +3,11 @@
 #define HERMES_REPORT_VERBOSE
 #define HERMES_REPORT_FILE "application.log"
 
+#include "hermes2d.h"
+#include "weakform/weakform.h"
+#include "integrals/h1.h"
+#include "boundaryconditions/essential_bcs.h"
+
 #include "timestep_controller.h"
 
 using namespace RefinementSelectors;
@@ -84,9 +89,9 @@ MatrixSolverType matrix_solver = SOLVER_UMFPACK;  // Possibilities: SOLVER_AMESO
 #include "initial_conditions.cpp"
 
 // Boundary markers.
-const std::string BDY_SIDE = "1";
-const std::string BDY_TOP = "2";
-const std::string BDY_BOT = "3";
+const std::string BDY_SIDE = "Side";
+const std::string BDY_TOP = "Top";
+const std::string BDY_BOT = "Bottom";
 
 int main (int argc, char* argv[]) {
   // Initialize the library's global functions.
@@ -107,7 +112,7 @@ int main (int argc, char* argv[]) {
 
   DefaultEssentialBCConst bc_phi_voltage(BDY_TOP, VOLTAGE);
   DefaultEssentialBCConst bc_phi_zero(BDY_BOT, 0.0);
-  EssentialBCs bcs_phi(Hermes::vector<EssentialBC*>(&bc_phi_voltage, &bc_phi_zero));
+  EssentialBCs bcs_phi(Hermes::vector<EssentialBoundaryCondition*>(&bc_phi_voltage, &bc_phi_zero));
 
   // Spaces for concentration and the voltage.
   H1Space C_space(&C_mesh, P_INIT);
@@ -137,7 +142,7 @@ int main (int argc, char* argv[]) {
 
   // Initialize the FE problem.
   bool is_linear = false;
-  DiscreteProblem dp_coarse(&wf, Hermes::vector<Space *>(&C_space, &phi_space), is_linear);
+  DiscreteProblem dp_coarse(&wf, Hermes::vector<Space *>(&C_space, &phi_space));
 
   // Set up the solver, matrix, and rhs for the coarse mesh according to the solver selection.
   SparseMatrix* matrix_coarse = create_matrix(matrix_solver);
@@ -199,7 +204,7 @@ int main (int argc, char* argv[]) {
       Hermes::vector<Space *>* ref_spaces = Space::construct_refined_spaces(Hermes::vector<Space *>(&C_space, &phi_space));
 
       scalar* coeff_vec = new scalar[Space::get_num_dofs(*ref_spaces)];
-      DiscreteProblem* dp = new DiscreteProblem(&wf, *ref_spaces, is_linear);
+      DiscreteProblem* dp = new DiscreteProblem(&wf, *ref_spaces);
       SparseMatrix* matrix = create_matrix(matrix_solver);
       Vector* rhs = create_vector(matrix_solver);
       Solver* solver = create_linear_solver(matrix_solver, matrix, rhs);
